@@ -32,6 +32,13 @@ import UniformTypeIdentifiers
 
 struct Config {
     var port: UInt16 = 9999
+    // Bind the HTTP server to loopback by default — the only legitimate
+    // client is the backend running on the same host, which reaches us
+    // via host.docker.internal. The previous default (INADDR_ANY)
+    // exposed /stream.mjpg and /snapshot.jpg to anyone on the local
+    // network with the port number (PER-106 #7). Use --bind 0.0.0.0
+    // explicitly when you really need that.
+    var bindHost: String = "127.0.0.1"
     var fps: Int = 15
     var quality: Float = 0.7
     var maxWidth: Int = 480
@@ -64,6 +71,13 @@ func parseArgs() -> Config {
         case "--port":
             i += 1
             c.port = UInt16(args[i]) ?? 9999
+        case "--bind":
+            // Explicit override of the loopback default — pass
+            // "0.0.0.0" to listen on all interfaces (only do this
+            // when you've put the host behind a firewall or are
+            // intentionally exposing the mirror to a LAN).
+            i += 1
+            c.bindHost = args[i]
         case "--fps":
             i += 1
             c.fps = Int(args[i]) ?? 15
@@ -389,13 +403,19 @@ final class MJPEGServer {
     private let store: FrameStore
     private let logger: Logger
     private let port: UInt16
+    // Address the listener binds to. Loopback by default — see Config
+    // for rationale. Stored as a C-friendly host string we feed to
+    // inet_pton; only "127.0.0.1" and "0.0.0.0" are routinely used,
+    // but any valid IPv4 dotted-quad parses.
+    private let bindHost: String
     private var listenerSocket: Int32 = -1
     private var running = true
 
-    init(store: FrameStore, logger: Logger, port: UInt16) {
+    init(store: FrameStore, logger: Logger, port: UInt16, bindHost: String = "127.0.0.1") {
         self.store = store
         self.logger = logger
         self.port = port
+        self.bindHost = bindHost
     }
 
     func start() throws {
@@ -409,7 +429,16 @@ final class MJPEGServer {
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = port.bigEndian
-        addr.sin_addr.s_addr = INADDR_ANY.bigEndian
+        // Translate the configured host string to a numeric address.
+        // Fall through to INADDR_LOOPBACK if parsing fails — safer
+        // default than INADDR_ANY when the operator typo'd the flag.
+        var parsed = in_addr()
+        if inet_pton(AF_INET, bindHost, &parsed) == 1 {
+            addr.sin_addr = parsed
+        } else {
+            logger.info("bind host '\(bindHost)' is not a valid IPv4 address — falling back to 127.0.0.1")
+            addr.sin_addr.s_addr = UInt32(0x7F000001).bigEndian  // 127.0.0.1
+        }
         let bindResult = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 Darwin.bind(listenerSocket, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
@@ -422,7 +451,7 @@ final class MJPEGServer {
             throw NSError(domain: "SimMirror", code: 12, userInfo: [NSLocalizedDescriptionKey: "listen() failed"])
         }
 
-        logger.info("HTTP server listening on 0.0.0.0:\(port)")
+        logger.info("HTTP server listening on \(bindHost):\(port)")
 
         Task.detached(priority: .userInitiated) { [weak self] in
             guard let self = self else { return }
@@ -578,7 +607,7 @@ guard #available(macOS 12.3, *) else {
 
 let store = FrameStore()
 let capture = WindowCapture(store: store, logger: logger, config: config)
-let server = MJPEGServer(store: store, logger: logger, port: config.port)
+let server = MJPEGServer(store: store, logger: logger, port: config.port, bindHost: config.bindHost)
 
 let semaphore = DispatchSemaphore(value: 0)
 
